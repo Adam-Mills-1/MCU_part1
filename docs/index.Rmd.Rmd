@@ -1,0 +1,378 @@
+---
+title: "MCU Box Office Analysis Part 1"
+author: "Adam Mills"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE)
+
+```
+
+
+# Part 1: data cleaning and preparation
+
+$$\\[0.2in]$$
+
+In this project we will take a brief look at the performance of the MCU (Marvel cinematic universe). The MCU is a narratively connected series of films released by Marvel studios and based on the Marvel comics by Stan Lee. There are currently 29 released films in the MCU, the first of which premiered in 2008. Over the past decade, the series has garnered both commercial and critical success and Marvel studios has produced some of the most financially lucrative films in history. We will seek to quantify and visualise the critical financial success of films within the MCU.
+
+We will begin by scraping and aggregating the relevant data.
+
+The bulk of the data is taken from a wikipedia table
+We can observe film names, the US release date, various box office earnings and film budgets.
+
+
+$$\\[0.35in]$$
+
+
+
+```{r, include = FALSE}
+
+# install Packages
+
+#install.packages("rvest")
+#install.packages("xml2") # scraping
+#install.packages("countrycode")
+
+```
+
+#### Load relevant packages for project
+
+Note: many of these packages are relevant only for parts 2 and 3
+
+```{r}
+
+library(rvest)
+library(xml2)
+library(tidyverse)
+library(gridExtra)
+library(lubridate)
+library(hrbrthemes)
+library(png)
+library(GGally)
+library(patchwork)
+library(viridis)
+library(ggrepel)
+library(scales)
+library(countrycode)
+library(sf)
+
+```
+
+
+
+CHANGE PROFIT TO EARNINGS
+
+
+Scrape data from wikipedia tables
+
+```{r}
+
+wiki_mcu <- read_html("https://en.wikipedia.org/wiki/List_of_Marvel_Cinematic_Universe_films")
+
+wiki_mcu %>% 
+  html_nodes(css = "table")
+
+```
+
+
+Observe the acquired data
+
+```{r}
+
+mcu_table <- 
+  wiki_mcu %>% 
+  html_nodes(css = "table") %>% 
+  nth(6) %>% 
+  html_table(fill = TRUE)
+
+head(mcu_table) # Observe first few rows of data
+
+```
+
+
+Data cleaning and preparation
+
+```{r}
+
+# Create data frame from scraped data
+
+mcu <- as.data.frame(mcu_table)
+
+
+# Remove refs column
+
+mcu <- mcu[,-9]
+
+
+# Set names of columns
+
+names(mcu) <- c('Film', 'US_release_date', 'Box_office_US_canada', 'Box_office_other', 'Box_office_world', 'Ranking_US_canada', 
+                       'Ranking_world', 'Budget')
+
+
+# Remove unnecessary rows
+
+mcu <- mcu %>%
+  filter(!row_number() %in% c(1, 2))
+
+
+# Change data type of date
+
+date <- as.Date(mcu$US_release_date, "%b %d, %Y")
+
+
+# Create new phase column
+
+mcu <- mcu %>% 
+  mutate(US_release_date = date) %>%
+  mutate(Phase =  ifelse (US_release_date < "2013-05-03", "1",
+      ifelse (US_release_date >= "2013-05-03" & US_release_date < "2016-05-06", "2",
+              ifelse (US_release_date >= "2016-05-06" & US_release_date < "2021-07-09", "3",
+                      ifelse (US_release_date >= "2021-07-09", "4", NA)))))
+
+
+# Remove original "phase" rows/ headers
+
+mcu <- mcu %>%                 
+  filter(!grepl('Phase', Film))
+
+    
+# Convert box office and budget strings to numeric
+
+mcu <- mcu %>%
+  mutate(across(contains("Box"), gsub, pattern = "[^0-9]", replacement = "")) %>% # Remove non numeric symbols 
+  mutate(across(contains("Box"), as.numeric)) %>%  # Convert to numeric
+  mutate(Budget = gsub("[a-z, $]", "", Budget)) # Remove letters and $ from Budget column
+
+
+Split <- str_split(mcu$Budget,"–|-") # Note: Have to account for 2 different hyphen characters
+Min_Budget <- sapply(Split, "[", 1)
+Max_Budget <- sapply(Split, "[", 2)
+
+
+
+for(i in 1:length(Max_Budget)){
+  ifelse(is.na(Max_Budget[i]) == TRUE, Max_Budget[i] <- Min_Budget[i] , Max_Budget[i] <- Max_Budget[i]) 
+} 
+
+
+mcu <- mcu %>%
+  mutate(Min_Budget = as.numeric(gsub("[^0-9.]", "", Min_Budget)) * 1000000) %>% # Convert to numeric 
+  mutate(Max_Budget = as.numeric(gsub("[^0-9.]", "", Max_Budget)) * 1000000) %>%
+  mutate(Ranking_US_canada = as.numeric(Ranking_US_canada)) %>%
+  mutate(Ranking_world = as.numeric(mcu$Ranking_world)) %>%
+  select(-Budget)
+
+
+mcu[nrow(mcu),"Min_Budget"] <- mcu[28,"Min_Budget"]*1000 #Convert total budgets to billions
+mcu[nrow(mcu),"Max_Budget"] <- mcu[28,"Max_Budget"]*1000
+
+
+# Add Year and Month columns
+
+mcu$Year <- year(as.POSIXlt(mcu$US_release_date, format = "%Y-%m-%d"))
+
+months <- c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+
+mcu$Month <- months[month(as.POSIXlt(mcu$US_release_date, format = "%Y-%m-%d"))]
+
+
+# Observe data
+
+glimpse(mcu)
+
+```
+
+
+
+$$\\[0.5in]$$
+
+### Add IMDB scores and rotten tomatoes ratings to data
+
+$$\\[0.2in]$$
+
+We will be looking at ratings for these films from rotten tomatoes a popular review aggregation site and IMDB, a database of film and tv information including critical scores.
+
+
+
+$$\\[0.35in]$$
+
+Scrape data from websites:
+
+```{r}
+
+# Rotten tomatoes data
+
+site <- "https://editorial.rottentomatoes.com/guide/all-marvel-cinematic-universe-movies-ranked/"
+site <- read_html(site)
+
+scores <- html_nodes(site,".tMeterScore") #Used selector gadget via chrome extension
+scores <- html_text(scores)
+
+
+titles <- html_nodes(site,".article_movie_title a")
+titles <- html_text(titles)
+
+
+tomato <- data.frame(Film = titles, tomatometer = scores)
+
+
+
+# IMDB data
+
+site2 <- "https://www.imdb.com/list/ls093312123/?sort=list_order,asc&st_dt=&mode=detail&page=1&title_type=movie&ref_=ttls_ref_typ"
+site2 <- read_html(site2)
+
+scores2 <- html_nodes(site2,".ipl-rating-star.small .ipl-rating-star__rating") # Used selector gadget via chrome extension
+scores2 <- html_text(scores2)
+
+titles2 <- html_nodes(site2,".lister-item-header a")
+titles2 <- html_text(titles2)
+titles2 <- titles2[1:length(scores2)] # Some films may have no score if they are unreleased
+
+
+imdb <- data.frame(Film = titles2, IMDB = scores2)
+
+```
+
+$$\\[0.35in]$$
+### Clean the ratings data
+
+```{r}
+
+# Filter out sony films not contained in the mcu
+
+imdb <- imdb %>% 
+  filter(!str_detect(Film, "^Venom")) %>%
+  filter(!str_detect(Film, "Morbius")) 
+
+
+# Rename necessary films to make visualisations more readable and naming schemes consistent
+
+tomato$Film <- as.character(tomato$Film)
+
+tomato$Film[25] <- ("Multiverse of Madness") 
+tomato$Film[23] <- ("Age of Ultron")
+tomato$Film[21] <- ("Captain America")
+tomato$Film[15] <- ("Infinity War")
+tomato$Film[12] <- ("The Winter Soldier")
+tomato$Film[10] <- ("Far From Home")
+tomato$Film[8] <- ("The Avengers")
+tomato$Film[6] <- ("Homecoming")
+tomato$Film[9] <- ("Shang-Chi")
+tomato$Film[5] <- ("No Way Home")
+tomato$Film[2] <- ("Endgame")
+
+imdb$Film <- as.character(imdb$Film)
+
+imdb$Film[1] <- ("Endgame")
+imdb$Film[2] <- ("Infinity War")
+imdb$Film[9] <- ("Captain America")
+imdb$Film[10] <- ("The Winter Soldier")
+imdb$Film[11] <- ("Age of Ultron")
+imdb$Film[14] <- ("Homecoming")
+imdb$Film[15] <- ("No Way Home")
+imdb$Film[18] <- ("Shang-Chi")
+imdb$Film[19] <-("Multiverse of Madness")
+imdb$Film[24] <- ("Far From Home")
+imdb$Film[25] <- ("Iron Man 3")
+imdb$Film[26] <- ("Ant-Man and The Wasp")
+
+
+# Revert to factor
+
+imdb$Film <- as.factor(imdb$Film)
+tomato$Film <- as.factor(tomato$Film)
+
+
+# Create ratings dataset by merging rotten tomatoes scores and imdb scores
+
+Ratings <- merge(tomato, imdb, by = "Film") 
+
+
+# Shorten some of the titles in mcu dataset to match with the new names
+
+mcu$Film <- as.character(mcu$Film)
+
+
+mcu[2,1] <- "The Incredible Hulk"
+mcu[5,1] <- "Captain America"
+mcu[6,1] <- "The Avengers"
+mcu[9,1] <- "The Winter Soldier"
+mcu[11,1] <- "Age of Ultron"
+mcu[16,1] <- "Homecoming"
+mcu[19,1] <- "Infinity War"
+mcu[20,1] <- ("Ant-Man and The Wasp")
+mcu[22,1] <- "Endgame"
+mcu[23,1] <- "Far From Home"
+mcu[25,1] <- "Shang-Chi"
+mcu[27,1] <- "No Way Home"
+mcu[28,1] <- "Multiverse of Madness"
+
+# Revert to factor
+
+mcu$Film <- as.factor(mcu$Film)
+
+
+```
+
+
+Merge the mcu and Ratings datasets together and arrange the dataframe according to the film's release date.
+
+```{r}
+
+mcu <- merge(Ratings, mcu, by = "Film") %>%
+  arrange(US_release_date)
+
+```
+
+
+Create an approximate budget column using existing max and min budget data:
+ 
+```{r}
+
+Approx_budget <- ((mcu$Max_Budget + mcu$Min_Budget)/2)
+
+mcu$Approx_budget <- Approx_budget
+
+```
+
+
+Create an approximate profits collumn
+
+```{r}
+
+mcu$Approx_profit <- mcu$Box_office_world-mcu$Approx_budget
+
+```
+
+
+Discard columns irrelevant to our analysis
+
+```{r}
+
+mcu <- mcu %>%
+  select( - c(Box_office_US_canada, Box_office_other, Ranking_world, Ranking_US_canada ))
+
+
+```
+
+
+Save and observe this data
+
+```{r}
+# Save mcu
+
+saveRDS(mcu, file = "mcu.rds")
+
+mcu <- readRDS(file = "mcu.rds")
+
+mcu
+
+```
+
+$$\\[0.4in]$$
